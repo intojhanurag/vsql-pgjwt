@@ -1,0 +1,7 @@
+{
+  "name": "vsql_pgjwt",
+  "version": "0.0.1",
+  "description": "JWT signing, verification, and decoding",
+  "author": "VillageSQL Contributors",
+  "license": "GPL-2.0"
+}

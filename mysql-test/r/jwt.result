@@ -1,0 +1,101 @@
+INSTALL EXTENSION vsql_pgjwt;
+# jwt_sign: HS256
+SELECT vsql_pgjwt.jwt_sign('{"sub":"user-42","exp":1893456000}', 'shhh', 'HS256');
+vsql_pgjwt.jwt_sign('{"sub":"user-42","exp":1893456000}', 'shhh', 'HS256')
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiZXhwIjoxODkzNDU2MDAwfQ.JWbmNYte_3w_mu1ru3O07Jt0BCt3Y0tKr4z4pEOIVXA
+# jwt_sign: HS384
+SELECT vsql_pgjwt.jwt_sign('{"sub":"user-42","exp":1893456000}', 'shhh', 'HS384');
+vsql_pgjwt.jwt_sign('{"sub":"user-42","exp":1893456000}', 'shhh', 'HS384')
+eyJhbGciOiJIUzM4NCIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiZXhwIjoxODkzNDU2MDAwfQ.tToKYoE8-99YM7AH3EEGI4yjJ8nZGHPGuDtCL90I3oRw-_Y87o0Xj4TaO3r9TGzj
+# jwt_sign: HS512
+SELECT vsql_pgjwt.jwt_sign('{"sub":"user-42","exp":1893456000}', 'shhh', 'HS512');
+vsql_pgjwt.jwt_sign('{"sub":"user-42","exp":1893456000}', 'shhh', 'HS512')
+eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiZXhwIjoxODkzNDU2MDAwfQ.Z5pJ26Gg6cL27F3bZ3NRHja_GlAX2KRwdenrc7C5dC_eZAVEZ61TS4gwi61kmom38R67n70tmTDK_LZgAhqi7w
+# jwt_sign: NULL inputs return NULL
+SELECT vsql_pgjwt.jwt_sign(NULL, 'shhh', 'HS256');
+vsql_pgjwt.jwt_sign(NULL, 'shhh', 'HS256')
+NULL
+SELECT vsql_pgjwt.jwt_sign('{}', NULL, 'HS256');
+vsql_pgjwt.jwt_sign('{}', NULL, 'HS256')
+NULL
+SELECT vsql_pgjwt.jwt_sign('{}', 'shhh', NULL);
+vsql_pgjwt.jwt_sign('{}', 'shhh', NULL)
+NULL
+# jwt_sign: unsupported algorithm
+SELECT vsql_pgjwt.jwt_sign('{}', 'shhh', 'NONE');
+ERROR 3200 (HY000): unsupported algorithm; use HS256, HS384, HS512, or RS256
+# jwt_decode: HS256 token
+SELECT vsql_pgjwt.jwt_decode('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiZXhwIjoxODkzNDU2MDAwfQ.JWbmNYte_3w_mu1ru3O07Jt0BCt3Y0tKr4z4pEOIVXA');
+vsql_pgjwt.jwt_decode('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiZXhwIjoxODkzNDU2MDAwfQ.JWbmNYte_3w_mu1ru3O07Jt0BCt3Y0tKr4z4pEOIVXA')
+{"header":{"alg":"HS256","typ":"JWT"},"payload":{"sub":"user-42","exp":1893456000}}
+# jwt_decode: HS384 token
+SELECT vsql_pgjwt.jwt_decode('eyJhbGciOiJIUzM4NCIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiZXhwIjoxODkzNDU2MDAwfQ.tToKYoE8-99YM7AH3EEGI4yjJ8nZGHPGuDtCL90I3oRw-_Y87o0Xj4TaO3r9TGzj');
+vsql_pgjwt.jwt_decode('eyJhbGciOiJIUzM4NCIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiZXhwIjoxODkzNDU2MDAwfQ.tToKYoE8-99YM7AH3EEGI4yjJ8nZGHPGuDtCL90I3oRw-_Y87o0Xj4TaO3r9TGzj')
+{"header":{"alg":"HS384","typ":"JWT"},"payload":{"sub":"user-42","exp":1893456000}}
+# jwt_decode: NULL
+SELECT vsql_pgjwt.jwt_decode(NULL);
+vsql_pgjwt.jwt_decode(NULL)
+NULL
+# jwt_decode: malformed token
+SELECT vsql_pgjwt.jwt_decode('not-a-jwt');
+ERROR 3200 (HY000): malformed token; expected header.payload.signature
+# jwt_verify: valid token with far-future exp
+SELECT vsql_pgjwt.jwt_verify('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiZXhwIjo5OTk5OTk5OTk5fQ.3mVWMgf8l4cGF47FqbQtb77353Uns4THWU5lGeoIKms', 'shhh', 'HS256');
+vsql_pgjwt.jwt_verify('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiZXhwIjo5OTk5OTk5OTk5fQ.3mVWMgf8l4cGF47FqbQtb77353Uns4THWU5lGeoIKms', 'shhh', 'HS256')
+{"valid":true,"header":{"alg":"HS256","typ":"JWT"},"payload":{"sub":"user-42","exp":9999999999}}
+# jwt_verify: wrong secret
+SELECT vsql_pgjwt.jwt_verify('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiZXhwIjo5OTk5OTk5OTk5fQ.3mVWMgf8l4cGF47FqbQtb77353Uns4THWU5lGeoIKms', 'wrong', 'HS256');
+vsql_pgjwt.jwt_verify('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiZXhwIjo5OTk5OTk5OTk5fQ.3mVWMgf8l4cGF47FqbQtb77353Uns4THWU5lGeoIKms', 'wrong', 'HS256')
+{"valid":false,"header":{"alg":"HS256","typ":"JWT"},"payload":{"sub":"user-42","exp":9999999999}}
+# jwt_verify: expired token
+SELECT vsql_pgjwt.jwt_verify('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiZXhwIjoxMDAwMDAwMDAwfQ.VcqKSy_JtD3JILtqRi_mbSQ8h-_0XEAThzUuBykeN3s', 'shhh', 'HS256');
+vsql_pgjwt.jwt_verify('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiZXhwIjoxMDAwMDAwMDAwfQ.VcqKSy_JtD3JILtqRi_mbSQ8h-_0XEAThzUuBykeN3s', 'shhh', 'HS256')
+{"valid":false,"header":{"alg":"HS256","typ":"JWT"},"payload":{"sub":"user-42","exp":1000000000}}
+# jwt_verify: not-yet-valid token (nbf in the future)
+SELECT vsql_pgjwt.jwt_verify('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwibmJmIjo5OTk5OTk5OTk5fQ.uIS5P-aGRfitkqke7JrPi5lgEQgyV7q2SJzaHGgw-kY', 'shhh', 'HS256');
+vsql_pgjwt.jwt_verify('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwibmJmIjo5OTk5OTk5OTk5fQ.uIS5P-aGRfitkqke7JrPi5lgEQgyV7q2SJzaHGgw-kY', 'shhh', 'HS256')
+{"valid":false,"header":{"alg":"HS256","typ":"JWT"},"payload":{"sub":"user-42","nbf":9999999999}}
+# jwt_verify: token without exp/nbf
+SELECT vsql_pgjwt.jwt_verify('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIn0.1XTB_3Wf5J7jaUuDNo_tDoy9kI0SOA9Cwe_7Lt29wPM', 'shhh', 'HS256');
+vsql_pgjwt.jwt_verify('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIn0.1XTB_3Wf5J7jaUuDNo_tDoy9kI0SOA9Cwe_7Lt29wPM', 'shhh', 'HS256')
+{"valid":true,"header":{"alg":"HS256","typ":"JWT"},"payload":{"sub":"user-42"}}
+# jwt_verify: NULL inputs
+SELECT vsql_pgjwt.jwt_verify(NULL, 'shhh', 'HS256');
+vsql_pgjwt.jwt_verify(NULL, 'shhh', 'HS256')
+NULL
+# jwt_verify: malformed token
+SELECT vsql_pgjwt.jwt_verify('not-a-jwt', 'shhh', 'HS256');
+ERROR 3200 (HY000): malformed token; expected header.payload.signature
+# jwt_verify: unsupported algorithm
+SELECT vsql_pgjwt.jwt_verify('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIn0.1XTB_3Wf5J7jaUuDNo_tDoy9kI0SOA9Cwe_7Lt29wPM', 'shhh', 'NONE');
+ERROR 3200 (HY000): unsupported algorithm; use HS256, HS384, HS512, or RS256
+# Roundtrip: sign then decode
+SELECT vsql_pgjwt.jwt_decode(vsql_pgjwt.jwt_sign('{"role":"admin"}', 'key', 'HS256'));
+vsql_pgjwt.jwt_decode(vsql_pgjwt.jwt_sign('{"role":"admin"}', 'key', 'HS256'))
+{"header":{"alg":"HS256","typ":"JWT"},"payload":{"role":"admin"}}
+# Roundtrip: sign then verify
+SELECT vsql_pgjwt.jwt_verify(vsql_pgjwt.jwt_sign('{"sub":"test"}', 'key', 'HS256'), 'key', 'HS256');
+vsql_pgjwt.jwt_verify(vsql_pgjwt.jwt_sign('{"sub":"test"}', 'key', 'HS256'), 'key', 'HS256')
+{"valid":true,"header":{"alg":"HS256","typ":"JWT"},"payload":{"sub":"test"}}
+# RS256: sign and verify with generated keys
+# RS256: sign produces a token
+SELECT LENGTH(@rs256_token) > 100 AS rs256_sign_ok;
+rs256_sign_ok
+1
+# RS256: verify with correct public key
+SELECT vsql_pgjwt.jwt_verify(@rs256_token, @rsa_pubkey, 'RS256') LIKE '%"valid":true%' AS rs256_verify_ok;
+rs256_verify_ok
+1
+# RS256: verify with wrong key
+SELECT vsql_pgjwt.jwt_verify(@rs256_token, 'wrong-key', 'RS256') LIKE '%"valid":false%' AS rs256_wrong_key_ok;
+rs256_wrong_key_ok
+1
+# RS256: decode shows payload
+SELECT vsql_pgjwt.jwt_decode(@rs256_token) LIKE '%"sub":"rs256-test"%' AS rs256_decode_ok;
+rs256_decode_ok
+1
+# Deterministic: jwt_sign produces same output
+SELECT vsql_pgjwt.jwt_sign('{"a":1}', 'k', 'HS256') = vsql_pgjwt.jwt_sign('{"a":1}', 'k', 'HS256') AS is_deterministic;
+is_deterministic
+1
+UNINSTALL EXTENSION vsql_pgjwt;

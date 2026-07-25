@@ -1,0 +1,431 @@
+// Copyright (c) 2026 VillageSQL Contributors
+//
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU General Public License
+// as published by the Free Software Foundation; either version 2
+// of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program; if not, see <https://www.gnu.org/licenses/>.
+
+#include <villagesql/vsql.h>
+
+#include <cctype>
+#include <cstring>
+#include <ctime>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/pem.h>
+
+using namespace vsql;
+
+static const char kBase64Chars[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static std::string base64url_encode(const unsigned char *data, size_t len) {
+  std::string out;
+  out.reserve(((len + 2) / 3) * 4);
+  for (size_t i = 0; i < len; i += 3) {
+    unsigned int val = data[i] << 16;
+    if (i + 1 < len) val |= data[i + 1] << 8;
+    if (i + 2 < len) val |= data[i + 2];
+    out += kBase64Chars[(val >> 18) & 0x3F];
+    out += kBase64Chars[(val >> 12) & 0x3F];
+    out += (i + 1 < len) ? kBase64Chars[(val >> 6) & 0x3F] : '=';
+    out += (i + 2 < len) ? kBase64Chars[val & 0x3F] : '=';
+  }
+  for (auto &c : out) {
+    if (c == '+')
+      c = '-';
+    else if (c == '/')
+      c = '_';
+  }
+  while (!out.empty() && out.back() == '=') out.pop_back();
+  return out;
+}
+
+static std::string base64url_encode(std::string_view sv) {
+  return base64url_encode(reinterpret_cast<const unsigned char *>(sv.data()),
+                          sv.size());
+}
+
+static bool base64url_decode(std::string_view input, std::string &out) {
+  static int tbl[256];
+  static bool init = false;
+  if (!init) {
+    memset(tbl, -1, sizeof(tbl));
+    for (int i = 0; i < 64; i++)
+      tbl[static_cast<unsigned char>(kBase64Chars[i])] = i;
+    init = true;
+  }
+
+  std::string b64;
+  b64.reserve(input.size() + 4);
+  for (char c : input) {
+    if (c == '-')
+      b64 += '+';
+    else if (c == '_')
+      b64 += '/';
+    else
+      b64 += c;
+  }
+  while (b64.size() % 4 != 0) b64 += '=';
+
+  out.clear();
+  out.reserve(b64.size() * 3 / 4);
+  for (size_t i = 0; i + 3 < b64.size(); i += 4) {
+    int v[4];
+    int pad = 0;
+    for (int j = 0; j < 4; j++) {
+      if (b64[i + j] == '=') {
+        v[j] = 0;
+        pad++;
+      } else {
+        v[j] = tbl[static_cast<unsigned char>(b64[i + j])];
+        if (v[j] < 0) return false;
+      }
+    }
+    unsigned int combined =
+        (v[0] << 18) | (v[1] << 12) | (v[2] << 6) | v[3];
+    out += static_cast<char>((combined >> 16) & 0xFF);
+    if (pad < 2) out += static_cast<char>((combined >> 8) & 0xFF);
+    if (pad < 1) out += static_cast<char>(combined & 0xFF);
+  }
+  return true;
+}
+
+static const EVP_MD *get_hmac_md(std::string_view alg) {
+  if (alg == "HS256") return EVP_sha256();
+  if (alg == "HS384") return EVP_sha384();
+  if (alg == "HS512") return EVP_sha512();
+  return nullptr;
+}
+
+static bool is_hmac_alg(std::string_view alg) {
+  return alg == "HS256" || alg == "HS384" || alg == "HS512";
+}
+
+static bool is_rsa_alg(std::string_view alg) { return alg == "RS256"; }
+
+static bool hmac_sign(std::string_view data, std::string_view key,
+                      const EVP_MD *md, std::string &out) {
+  unsigned char buf[EVP_MAX_MD_SIZE];
+  unsigned int len = 0;
+  if (!HMAC(md, key.data(), static_cast<int>(key.size()),
+            reinterpret_cast<const unsigned char *>(data.data()), data.size(),
+            buf, &len)) {
+    return false;
+  }
+  out = base64url_encode(buf, len);
+  return true;
+}
+
+static bool rsa_sign(std::string_view data, std::string_view pem_key,
+                     std::string &out) {
+  BIO *bio =
+      BIO_new_mem_buf(pem_key.data(), static_cast<int>(pem_key.size()));
+  if (!bio) return false;
+
+  EVP_PKEY *pkey = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
+  BIO_free(bio);
+  if (!pkey) return false;
+
+  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+  if (!ctx) {
+    EVP_PKEY_free(pkey);
+    return false;
+  }
+
+  bool ok = false;
+  if (EVP_DigestSignInit(ctx, nullptr, EVP_sha256(), nullptr, pkey) == 1 &&
+      EVP_DigestSignUpdate(ctx, data.data(), data.size()) == 1) {
+    size_t sig_len = 0;
+    if (EVP_DigestSignFinal(ctx, nullptr, &sig_len) == 1) {
+      std::vector<unsigned char> sig(sig_len);
+      if (EVP_DigestSignFinal(ctx, sig.data(), &sig_len) == 1) {
+        out = base64url_encode(sig.data(), sig_len);
+        ok = true;
+      }
+    }
+  }
+
+  EVP_MD_CTX_free(ctx);
+  EVP_PKEY_free(pkey);
+  return ok;
+}
+
+static bool rsa_verify_sig(std::string_view data, std::string_view sig_b64url,
+                           std::string_view pem_key) {
+  std::string sig_raw;
+  if (!base64url_decode(sig_b64url, sig_raw)) return false;
+
+  BIO *bio =
+      BIO_new_mem_buf(pem_key.data(), static_cast<int>(pem_key.size()));
+  if (!bio) return false;
+
+  EVP_PKEY *pkey = PEM_read_bio_PUBKEY(bio, nullptr, nullptr, nullptr);
+  BIO_free(bio);
+  if (!pkey) return false;
+
+  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+  if (!ctx) {
+    EVP_PKEY_free(pkey);
+    return false;
+  }
+
+  bool ok = false;
+  if (EVP_DigestVerifyInit(ctx, nullptr, EVP_sha256(), nullptr, pkey) == 1 &&
+      EVP_DigestVerifyUpdate(ctx, data.data(), data.size()) == 1) {
+    ok = (EVP_DigestVerifyFinal(
+              ctx, reinterpret_cast<const unsigned char *>(sig_raw.data()),
+              sig_raw.size()) == 1);
+  }
+
+  EVP_MD_CTX_free(ctx);
+  EVP_PKEY_free(pkey);
+  return ok;
+}
+
+static bool split_token(std::string_view token, std::string_view &header,
+                        std::string_view &payload,
+                        std::string_view &signature) {
+  auto dot1 = token.find('.');
+  if (dot1 == std::string_view::npos) return false;
+  auto dot2 = token.find('.', dot1 + 1);
+  if (dot2 == std::string_view::npos) return false;
+  if (token.find('.', dot2 + 1) != std::string_view::npos) return false;
+
+  header = token.substr(0, dot1);
+  payload = token.substr(dot1 + 1, dot2 - dot1 - 1);
+  signature = token.substr(dot2 + 1);
+  return true;
+}
+
+static bool extract_json_int(std::string_view json, const char *key,
+                             long long &val) {
+  std::string pat = "\"";
+  pat += key;
+  pat += "\"";
+
+  auto pos = json.find(pat);
+  if (pos == std::string_view::npos) return false;
+  pos += pat.size();
+
+  while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+  if (pos >= json.size() || json[pos] != ':') return false;
+  pos++;
+  while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
+
+  if (pos >= json.size()) return false;
+
+  bool neg = false;
+  if (json[pos] == '-') {
+    neg = true;
+    pos++;
+  }
+  if (pos >= json.size() ||
+      !std::isdigit(static_cast<unsigned char>(json[pos])))
+    return false;
+
+  long long num = 0;
+  while (pos < json.size() &&
+         std::isdigit(static_cast<unsigned char>(json[pos]))) {
+    num = num * 10 + (json[pos] - '0');
+    pos++;
+  }
+
+  val = neg ? -num : num;
+  return true;
+}
+
+static bool constant_time_eq(std::string_view a, std::string_view b) {
+  if (a.size() != b.size()) return false;
+  unsigned char result = 0;
+  for (size_t i = 0; i < a.size(); i++) {
+    result |= static_cast<unsigned char>(a[i]) ^
+              static_cast<unsigned char>(b[i]);
+  }
+  return result == 0;
+}
+
+// jwt_sign(payload TEXT, secret TEXT, algorithm TEXT) -> TEXT
+void vdf_jwt_sign(StringArg payload_arg, StringArg secret_arg,
+                  StringArg algorithm_arg, StringResult out) {
+  if (payload_arg.is_null() || secret_arg.is_null() ||
+      algorithm_arg.is_null()) {
+    out.set_null();
+    return;
+  }
+
+  auto payload = payload_arg.value();
+  auto secret = secret_arg.value();
+  auto alg = algorithm_arg.value();
+
+  if (!is_hmac_alg(alg) && !is_rsa_alg(alg)) {
+    out.error("unsupported algorithm; use HS256, HS384, HS512, or RS256");
+    return;
+  }
+
+  std::string header = "{\"alg\":\"";
+  header += alg;
+  header += "\",\"typ\":\"JWT\"}";
+
+  std::string header_b64 = base64url_encode(header);
+  std::string payload_b64 = base64url_encode(payload);
+  std::string signable = header_b64 + "." + payload_b64;
+
+  std::string sig_b64;
+  if (is_hmac_alg(alg)) {
+    const EVP_MD *md = get_hmac_md(alg);
+    if (!hmac_sign(signable, secret, md, sig_b64)) {
+      out.error("HMAC signing failed");
+      return;
+    }
+  } else {
+    if (!rsa_sign(signable, secret, sig_b64)) {
+      out.error(
+          "RSA signing failed; check that the key is a valid PEM private key");
+      return;
+    }
+  }
+
+  std::string token = signable + "." + sig_b64;
+  out.set(std::string_view(token));
+}
+
+// jwt_verify(token TEXT, secret TEXT, algorithm TEXT) -> TEXT
+void vdf_jwt_verify(StringArg token_arg, StringArg secret_arg,
+                    StringArg algorithm_arg, StringResult out) {
+  if (token_arg.is_null() || secret_arg.is_null() ||
+      algorithm_arg.is_null()) {
+    out.set_null();
+    return;
+  }
+
+  auto token = token_arg.value();
+  auto secret = secret_arg.value();
+  auto alg = algorithm_arg.value();
+
+  if (!is_hmac_alg(alg) && !is_rsa_alg(alg)) {
+    out.error("unsupported algorithm; use HS256, HS384, HS512, or RS256");
+    return;
+  }
+
+  std::string_view hdr_b64, pay_b64, sig_b64;
+  if (!split_token(token, hdr_b64, pay_b64, sig_b64)) {
+    out.error("malformed token; expected header.payload.signature");
+    return;
+  }
+
+  std::string header_json, payload_json;
+  if (!base64url_decode(hdr_b64, header_json) ||
+      !base64url_decode(pay_b64, payload_json)) {
+    out.error("invalid base64url encoding in token");
+    return;
+  }
+
+  std::string signable(hdr_b64);
+  signable += '.';
+  signable += pay_b64;
+
+  bool sig_ok = false;
+  if (is_hmac_alg(alg)) {
+    const EVP_MD *md = get_hmac_md(alg);
+    std::string expected_sig;
+    if (hmac_sign(signable, secret, md, expected_sig)) {
+      sig_ok = constant_time_eq(expected_sig, sig_b64);
+    }
+  } else {
+    sig_ok = rsa_verify_sig(signable, sig_b64, secret);
+  }
+
+  bool time_ok = true;
+  if (sig_ok) {
+    time_t now = time(nullptr);
+    long long exp_val;
+    if (extract_json_int(payload_json, "exp", exp_val)) {
+      if (now >= static_cast<time_t>(exp_val)) time_ok = false;
+    }
+    long long nbf_val;
+    if (extract_json_int(payload_json, "nbf", nbf_val)) {
+      if (now < static_cast<time_t>(nbf_val)) time_ok = false;
+    }
+  }
+
+  bool valid = sig_ok && time_ok;
+
+  std::string result = "{\"valid\":";
+  result += (valid ? "true" : "false");
+  result += ",\"header\":";
+  result += header_json;
+  result += ",\"payload\":";
+  result += payload_json;
+  result += "}";
+
+  out.set(std::string_view(result));
+}
+
+// jwt_decode(token TEXT) -> TEXT
+void vdf_jwt_decode(StringArg token_arg, StringResult out) {
+  if (token_arg.is_null()) {
+    out.set_null();
+    return;
+  }
+
+  auto token = token_arg.value();
+
+  std::string_view hdr_b64, pay_b64, sig_b64;
+  if (!split_token(token, hdr_b64, pay_b64, sig_b64)) {
+    out.error("malformed token; expected header.payload.signature");
+    return;
+  }
+
+  std::string header_json, payload_json;
+  if (!base64url_decode(hdr_b64, header_json) ||
+      !base64url_decode(pay_b64, payload_json)) {
+    out.error("invalid base64url encoding in token");
+    return;
+  }
+
+  std::string result = "{\"header\":";
+  result += header_json;
+  result += ",\"payload\":";
+  result += payload_json;
+  result += "}";
+
+  out.set(std::string_view(result));
+}
+
+VEF_GENERATE_ENTRY_POINTS(
+    make_extension()
+        .func(make_func<&vdf_jwt_sign>("jwt_sign")
+                  .returns(STRING)
+                  .param(STRING)
+                  .param(STRING)
+                  .param(STRING)
+                  .buffer_size(16384)
+                  .deterministic()
+                  .build())
+        .func(make_func<&vdf_jwt_verify>("jwt_verify")
+                  .returns(STRING)
+                  .param(STRING)
+                  .param(STRING)
+                  .param(STRING)
+                  .buffer_size(16384)
+                  .build())
+        .func(make_func<&vdf_jwt_decode>("jwt_decode")
+                  .returns(STRING)
+                  .param(STRING)
+                  .buffer_size(16384)
+                  .deterministic()
+                  .build()))
