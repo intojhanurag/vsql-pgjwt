@@ -67,6 +67,34 @@ SELECT vsql_pgjwt.jwt_decode(
 | HS512 | HMAC-SHA512 | Shared secret |
 | RS256 | RSA PKCS#1 v1.5 + SHA-256 | PEM private key (sign) / PEM public key (verify) |
 
+## Using with JSON functions
+
+VEF STRING results currently use `binary` charset, so wrap the output with
+`CONVERT(... USING utf8mb4)` before passing it to MySQL JSON functions:
+
+```sql
+SET @result = CONVERT(
+  vsql_pgjwt.jwt_decode('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiZXhwIjoxODkzNDU2MDAwfQ.JWbmNYte_3w_mu1ru3O07Jt0BCt3Y0tKr4z4pEOIVXA')
+  USING utf8mb4
+);
+SELECT JSON_VALUE(@result, '$.payload.sub');
+-- 'user-42'
+```
+
+## Error handling
+
+`jwt_verify` and `jwt_decode` return `NULL` (with a warning) for invalid input
+such as malformed tokens, bad base64, or unsupported algorithms. This allows
+them to be used safely in queries over untrusted data:
+
+```sql
+SELECT id, vsql_pgjwt.jwt_verify(token, 'secret', 'HS256') FROM tokens;
+-- rows with bad tokens get NULL instead of aborting the query
+```
+
+`jwt_sign` raises an error for unsupported algorithms or invalid keys, since
+the caller controls those inputs.
+
 ## Installation
 
 ```sql

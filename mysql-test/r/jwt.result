@@ -1,3 +1,8 @@
+call mtr.add_suppression("Orphaned expansion directory found but not removed");
+call mtr.add_suppression("unsupported algorithm");
+call mtr.add_suppression("malformed token");
+call mtr.add_suppression("invalid base64url encoding");
+call mtr.add_suppression("token segments are not valid JSON");
 INSTALL EXTENSION vsql_pgjwt;
 # jwt_sign: HS256
 SELECT vsql_pgjwt.jwt_sign('{"sub":"user-42","exp":1893456000}', 'shhh', 'HS256');
@@ -21,9 +26,9 @@ NULL
 SELECT vsql_pgjwt.jwt_sign('{}', 'shhh', NULL);
 vsql_pgjwt.jwt_sign('{}', 'shhh', NULL)
 NULL
-# jwt_sign: unsupported algorithm
+# jwt_sign: unsupported algorithm (error — caller controls input)
 SELECT vsql_pgjwt.jwt_sign('{}', 'shhh', 'NONE');
-ERROR 3200 (HY000): unsupported algorithm; use HS256, HS384, HS512, or RS256
+ERROR HY000: VDF error in function 'jwt_sign': unsupported algorithm; use HS256, HS384, HS512, or RS256
 # jwt_decode: HS256 token
 SELECT vsql_pgjwt.jwt_decode('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiZXhwIjoxODkzNDU2MDAwfQ.JWbmNYte_3w_mu1ru3O07Jt0BCt3Y0tKr4z4pEOIVXA');
 vsql_pgjwt.jwt_decode('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiZXhwIjoxODkzNDU2MDAwfQ.JWbmNYte_3w_mu1ru3O07Jt0BCt3Y0tKr4z4pEOIVXA')
@@ -36,9 +41,10 @@ vsql_pgjwt.jwt_decode('eyJhbGciOiJIUzM4NCIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQy
 SELECT vsql_pgjwt.jwt_decode(NULL);
 vsql_pgjwt.jwt_decode(NULL)
 NULL
-# jwt_decode: malformed token
+# jwt_decode: malformed token (returns NULL with warning)
 SELECT vsql_pgjwt.jwt_decode('not-a-jwt');
-ERROR 3200 (HY000): malformed token; expected header.payload.signature
+vsql_pgjwt.jwt_decode('not-a-jwt')
+NULL
 # jwt_verify: valid token with far-future exp
 SELECT vsql_pgjwt.jwt_verify('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiZXhwIjo5OTk5OTk5OTk5fQ.3mVWMgf8l4cGF47FqbQtb77353Uns4THWU5lGeoIKms', 'shhh', 'HS256');
 vsql_pgjwt.jwt_verify('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiZXhwIjo5OTk5OTk5OTk5fQ.3mVWMgf8l4cGF47FqbQtb77353Uns4THWU5lGeoIKms', 'shhh', 'HS256')
@@ -63,12 +69,18 @@ vsql_pgjwt.jwt_verify('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQy
 SELECT vsql_pgjwt.jwt_verify(NULL, 'shhh', 'HS256');
 vsql_pgjwt.jwt_verify(NULL, 'shhh', 'HS256')
 NULL
-# jwt_verify: malformed token
+# jwt_verify: malformed token (returns NULL with warning)
 SELECT vsql_pgjwt.jwt_verify('not-a-jwt', 'shhh', 'HS256');
-ERROR 3200 (HY000): malformed token; expected header.payload.signature
-# jwt_verify: unsupported algorithm
+vsql_pgjwt.jwt_verify('not-a-jwt', 'shhh', 'HS256')
+NULL
+# jwt_verify: unsupported algorithm (returns NULL with warning)
 SELECT vsql_pgjwt.jwt_verify('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIn0.1XTB_3Wf5J7jaUuDNo_tDoy9kI0SOA9Cwe_7Lt29wPM', 'shhh', 'NONE');
-ERROR 3200 (HY000): unsupported algorithm; use HS256, HS384, HS512, or RS256
+vsql_pgjwt.jwt_verify('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIn0.1XTB_3Wf5J7jaUuDNo_tDoy9kI0SOA9Cwe_7Lt29wPM', 'shhh', 'NONE')
+NULL
+# Nested key: exp inside nested object should NOT be matched
+SELECT vsql_pgjwt.jwt_verify(vsql_pgjwt.jwt_sign('{"data":{"exp":1000000000},"active":true}', 'k', 'HS256'), 'k', 'HS256') LIKE '%"valid":true%' AS nested_exp_ignored;
+nested_exp_ignored
+1
 # Roundtrip: sign then decode
 SELECT vsql_pgjwt.jwt_decode(vsql_pgjwt.jwt_sign('{"role":"admin"}', 'key', 'HS256'));
 vsql_pgjwt.jwt_decode(vsql_pgjwt.jwt_sign('{"role":"admin"}', 'key', 'HS256'))
@@ -98,4 +110,5 @@ rs256_decode_ok
 SELECT vsql_pgjwt.jwt_sign('{"a":1}', 'k', 'HS256') = vsql_pgjwt.jwt_sign('{"a":1}', 'k', 'HS256') AS is_deterministic;
 is_deterministic
 1
+# Cleanup temp files
 UNINSTALL EXTENSION vsql_pgjwt;

@@ -59,15 +59,23 @@ static std::string base64url_encode(std::string_view sv) {
                           sv.size());
 }
 
+static constexpr auto make_b64_table() {
+  struct Table {
+    int data[256]{};
+    constexpr Table() {
+      const char chars[] =
+          "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+      for (int i = 0; i < 256; i++) data[i] = -1;
+      for (int i = 0; i < 64; i++)
+        data[static_cast<unsigned char>(chars[i])] = i;
+    }
+  };
+  return Table();
+}
+
+static constexpr auto kB64Table = make_b64_table();
+
 static bool base64url_decode(std::string_view input, std::string &out) {
-  static int tbl[256];
-  static bool init = false;
-  if (!init) {
-    memset(tbl, -1, sizeof(tbl));
-    for (int i = 0; i < 64; i++)
-      tbl[static_cast<unsigned char>(kBase64Chars[i])] = i;
-    init = true;
-  }
 
   std::string b64;
   b64.reserve(input.size() + 4);
@@ -91,7 +99,7 @@ static bool base64url_decode(std::string_view input, std::string &out) {
         v[j] = 0;
         pad++;
       } else {
-        v[j] = tbl[static_cast<unsigned char>(b64[i + j])];
+        v[j] = kB64Table.data[static_cast<unsigned char>(b64[i + j])];
         if (v[j] < 0) return false;
       }
     }
@@ -217,35 +225,55 @@ static bool extract_json_int(std::string_view json, const char *key,
   pat += key;
   pat += "\"";
 
-  auto pos = json.find(pat);
-  if (pos == std::string_view::npos) return false;
-  pos += pat.size();
-
-  while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
-  if (pos >= json.size() || json[pos] != ':') return false;
-  pos++;
-  while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) pos++;
-
-  if (pos >= json.size()) return false;
-
-  bool neg = false;
-  if (json[pos] == '-') {
-    neg = true;
-    pos++;
+  int depth = 0;
+  for (size_t i = 0; i < json.size(); i++) {
+    char c = json[i];
+    if (c == '{' || c == '[') {
+      depth++;
+      continue;
+    }
+    if (c == '}' || c == ']') {
+      depth--;
+      continue;
+    }
+    if (c == '"') {
+      size_t end = json.find('"', i + 1);
+      if (end == std::string_view::npos) return false;
+      if (depth == 1 && json.substr(i, end - i + 1) == pat) {
+        size_t pos = end + 1;
+        while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
+          pos++;
+        if (pos >= json.size() || json[pos] != ':') {
+          i = end;
+          continue;
+        }
+        pos++;
+        while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
+          pos++;
+        if (pos >= json.size()) return false;
+        bool neg = false;
+        if (json[pos] == '-') {
+          neg = true;
+          pos++;
+        }
+        if (pos >= json.size() ||
+            !std::isdigit(static_cast<unsigned char>(json[pos])))
+          return false;
+        long long num = 0;
+        int digits = 0;
+        while (pos < json.size() &&
+               std::isdigit(static_cast<unsigned char>(json[pos]))) {
+          if (++digits > 18) return false;
+          num = num * 10 + (json[pos] - '0');
+          pos++;
+        }
+        val = neg ? -num : num;
+        return true;
+      }
+      i = end;
+    }
   }
-  if (pos >= json.size() ||
-      !std::isdigit(static_cast<unsigned char>(json[pos])))
-    return false;
-
-  long long num = 0;
-  while (pos < json.size() &&
-         std::isdigit(static_cast<unsigned char>(json[pos]))) {
-    num = num * 10 + (json[pos] - '0');
-    pos++;
-  }
-
-  val = neg ? -num : num;
-  return true;
+  return false;
 }
 
 static bool constant_time_eq(std::string_view a, std::string_view b) {
@@ -317,20 +345,30 @@ void vdf_jwt_verify(StringArg token_arg, StringArg secret_arg,
   auto alg = algorithm_arg.value();
 
   if (!is_hmac_alg(alg) && !is_rsa_alg(alg)) {
-    out.error("unsupported algorithm; use HS256, HS384, HS512, or RS256");
+    out.warning("unsupported algorithm; use HS256, HS384, HS512, or RS256");
+    out.set_null();
     return;
   }
 
   std::string_view hdr_b64, pay_b64, sig_b64;
   if (!split_token(token, hdr_b64, pay_b64, sig_b64)) {
-    out.error("malformed token; expected header.payload.signature");
+    out.warning("malformed token; expected header.payload.signature");
+    out.set_null();
     return;
   }
 
   std::string header_json, payload_json;
   if (!base64url_decode(hdr_b64, header_json) ||
       !base64url_decode(pay_b64, payload_json)) {
-    out.error("invalid base64url encoding in token");
+    out.warning("invalid base64url encoding in token");
+    out.set_null();
+    return;
+  }
+
+  if (header_json.empty() || header_json.front() != '{' ||
+      payload_json.empty() || payload_json.front() != '{') {
+    out.warning("token segments are not valid JSON objects");
+    out.set_null();
     return;
   }
 
@@ -386,14 +424,23 @@ void vdf_jwt_decode(StringArg token_arg, StringResult out) {
 
   std::string_view hdr_b64, pay_b64, sig_b64;
   if (!split_token(token, hdr_b64, pay_b64, sig_b64)) {
-    out.error("malformed token; expected header.payload.signature");
+    out.warning("malformed token; expected header.payload.signature");
+    out.set_null();
     return;
   }
 
   std::string header_json, payload_json;
   if (!base64url_decode(hdr_b64, header_json) ||
       !base64url_decode(pay_b64, payload_json)) {
-    out.error("invalid base64url encoding in token");
+    out.warning("invalid base64url encoding in token");
+    out.set_null();
+    return;
+  }
+
+  if (header_json.empty() || header_json.front() != '{' ||
+      payload_json.empty() || payload_json.front() != '{') {
+    out.warning("token segments are not valid JSON objects");
+    out.set_null();
     return;
   }
 
