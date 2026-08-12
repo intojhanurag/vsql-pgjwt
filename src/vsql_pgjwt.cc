@@ -76,6 +76,10 @@ static constexpr auto make_b64_table() {
 static constexpr auto kB64Table = make_b64_table();
 
 static bool base64url_decode(std::string_view input, std::string &out) {
+  // RFC 7515 base64url carries no padding, and a length of 1 mod 4 cannot
+  // encode any byte sequence. Reject both rather than decoding around them.
+  if (input.find('=') != std::string_view::npos) return false;
+  if (input.size() % 4 == 1) return false;
 
   std::string b64;
   b64.reserve(input.size() + 4);
@@ -219,8 +223,68 @@ static bool split_token(std::string_view token, std::string_view &header,
   return true;
 }
 
-static bool extract_json_int(std::string_view json, const char *key,
-                             long long &val) {
+static bool is_json_space(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+// Index of the closing quote of the string starting at `open` (which must be
+// the opening quote), or npos if unterminated. A quote preceded by an odd
+// number of backslashes is escaped and does not close the string.
+static size_t json_string_end(std::string_view json, size_t open) {
+  for (size_t i = open + 1; i < json.size(); i++) {
+    if (json[i] == '\\') {
+      i++;  // skip the escaped character, whatever it is
+      continue;
+    }
+    if (json[i] == '"') return i;
+  }
+  return std::string_view::npos;
+}
+
+// Structural check: `json` is one balanced object, with every string
+// terminated, and nothing but whitespace after the closing brace. Enough to
+// guarantee the value can be spliced into a larger JSON document without
+// corrupting it; it does not validate value grammar.
+static bool json_is_wellformed_object(std::string_view json) {
+  size_t i = 0;
+  while (i < json.size() && is_json_space(json[i])) i++;
+  if (i >= json.size() || json[i] != '{') return false;
+
+  int depth = 0;
+  for (; i < json.size(); i++) {
+    char c = json[i];
+    if (c == '"') {
+      size_t end = json_string_end(json, i);
+      if (end == std::string_view::npos) return false;
+      i = end;
+      continue;
+    }
+    if (c == '{' || c == '[') {
+      depth++;
+      continue;
+    }
+    if (c == '}' || c == ']') {
+      if (--depth == 0) break;
+      if (depth < 0) return false;
+      continue;
+    }
+  }
+  if (depth != 0) return false;
+
+  for (i++; i < json.size(); i++) {
+    if (!is_json_space(json[i])) return false;
+  }
+  return true;
+}
+
+enum class ClaimResult {
+  kAbsent,   // key not present at the top level
+  kParsed,   // key present and read into `val`
+  kMalformed // key present but not a usable integer
+};
+
+static ClaimResult extract_json_int(std::string_view json, const char *key,
+                                    long long &val) {
   std::string pat = "\"";
   pat += key;
   pat += "\"";
@@ -236,44 +300,51 @@ static bool extract_json_int(std::string_view json, const char *key,
       depth--;
       continue;
     }
-    if (c == '"') {
-      size_t end = json.find('"', i + 1);
-      if (end == std::string_view::npos) return false;
-      if (depth == 1 && json.substr(i, end - i + 1) == pat) {
-        size_t pos = end + 1;
-        while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
-          pos++;
-        if (pos >= json.size() || json[pos] != ':') {
-          i = end;
-          continue;
-        }
-        pos++;
-        while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t'))
-          pos++;
-        if (pos >= json.size()) return false;
-        bool neg = false;
-        if (json[pos] == '-') {
-          neg = true;
-          pos++;
-        }
-        if (pos >= json.size() ||
-            !std::isdigit(static_cast<unsigned char>(json[pos])))
-          return false;
-        long long num = 0;
-        int digits = 0;
-        while (pos < json.size() &&
-               std::isdigit(static_cast<unsigned char>(json[pos]))) {
-          if (++digits > 18) return false;
-          num = num * 10 + (json[pos] - '0');
-          pos++;
-        }
-        val = neg ? -num : num;
-        return true;
-      }
+    if (c != '"') continue;
+
+    size_t end = json_string_end(json, i);
+    if (end == std::string_view::npos) return ClaimResult::kMalformed;
+    if (depth != 1 || json.substr(i, end - i + 1) != pat) {
       i = end;
+      continue;
     }
+
+    // Found the key at the top level. From here every exit is terminal: a
+    // second occurrence must not be consulted, and an unusable value must
+    // never read as "no expiry set".
+    size_t pos = end + 1;
+    while (pos < json.size() && is_json_space(json[pos])) pos++;
+    if (pos >= json.size() || json[pos] != ':') return ClaimResult::kMalformed;
+    pos++;
+    while (pos < json.size() && is_json_space(json[pos])) pos++;
+    if (pos >= json.size()) return ClaimResult::kMalformed;
+
+    bool neg = false;
+    if (json[pos] == '-') {
+      neg = true;
+      pos++;
+    }
+    if (pos >= json.size() ||
+        !std::isdigit(static_cast<unsigned char>(json[pos])))
+      return ClaimResult::kMalformed;
+
+    long long num = 0;
+    int digits = 0;
+    while (pos < json.size() &&
+           std::isdigit(static_cast<unsigned char>(json[pos]))) {
+      if (++digits > 18) return ClaimResult::kMalformed;
+      num = num * 10 + (json[pos] - '0');
+      pos++;
+    }
+    // A fractional or exponent part means this is not a NumericDate integer.
+    if (pos < json.size() && (json[pos] == '.' || json[pos] == 'e' ||
+                              json[pos] == 'E'))
+      return ClaimResult::kMalformed;
+
+    val = neg ? -num : num;
+    return ClaimResult::kParsed;
   }
-  return false;
+  return ClaimResult::kAbsent;
 }
 
 static bool constant_time_eq(std::string_view a, std::string_view b) {
@@ -346,14 +417,12 @@ void vdf_jwt_verify(StringArg token_arg, StringArg secret_arg,
 
   if (!is_hmac_alg(alg) && !is_rsa_alg(alg)) {
     out.warning("unsupported algorithm; use HS256, HS384, HS512, or RS256");
-    out.set_null();
     return;
   }
 
   std::string_view hdr_b64, pay_b64, sig_b64;
   if (!split_token(token, hdr_b64, pay_b64, sig_b64)) {
     out.warning("malformed token; expected header.payload.signature");
-    out.set_null();
     return;
   }
 
@@ -361,14 +430,12 @@ void vdf_jwt_verify(StringArg token_arg, StringArg secret_arg,
   if (!base64url_decode(hdr_b64, header_json) ||
       !base64url_decode(pay_b64, payload_json)) {
     out.warning("invalid base64url encoding in token");
-    out.set_null();
     return;
   }
 
-  if (header_json.empty() || header_json.front() != '{' ||
-      payload_json.empty() || payload_json.front() != '{') {
+  if (!json_is_wellformed_object(header_json) ||
+      !json_is_wellformed_object(payload_json)) {
     out.warning("token segments are not valid JSON objects");
-    out.set_null();
     return;
   }
 
@@ -391,12 +458,26 @@ void vdf_jwt_verify(StringArg token_arg, StringArg secret_arg,
   if (sig_ok) {
     time_t now = time(nullptr);
     long long exp_val;
-    if (extract_json_int(payload_json, "exp", exp_val)) {
-      if (now >= static_cast<time_t>(exp_val)) time_ok = false;
+    switch (extract_json_int(payload_json, "exp", exp_val)) {
+      case ClaimResult::kParsed:
+        if (now >= static_cast<time_t>(exp_val)) time_ok = false;
+        break;
+      case ClaimResult::kMalformed:
+        time_ok = false;  // an exp we cannot read is not an exp we can honour
+        break;
+      case ClaimResult::kAbsent:
+        break;
     }
     long long nbf_val;
-    if (extract_json_int(payload_json, "nbf", nbf_val)) {
-      if (now < static_cast<time_t>(nbf_val)) time_ok = false;
+    switch (extract_json_int(payload_json, "nbf", nbf_val)) {
+      case ClaimResult::kParsed:
+        if (now < static_cast<time_t>(nbf_val)) time_ok = false;
+        break;
+      case ClaimResult::kMalformed:
+        time_ok = false;
+        break;
+      case ClaimResult::kAbsent:
+        break;
     }
   }
 
@@ -425,7 +506,6 @@ void vdf_jwt_decode(StringArg token_arg, StringResult out) {
   std::string_view hdr_b64, pay_b64, sig_b64;
   if (!split_token(token, hdr_b64, pay_b64, sig_b64)) {
     out.warning("malformed token; expected header.payload.signature");
-    out.set_null();
     return;
   }
 
@@ -433,14 +513,12 @@ void vdf_jwt_decode(StringArg token_arg, StringResult out) {
   if (!base64url_decode(hdr_b64, header_json) ||
       !base64url_decode(pay_b64, payload_json)) {
     out.warning("invalid base64url encoding in token");
-    out.set_null();
     return;
   }
 
-  if (header_json.empty() || header_json.front() != '{' ||
-      payload_json.empty() || payload_json.front() != '{') {
+  if (!json_is_wellformed_object(header_json) ||
+      !json_is_wellformed_object(payload_json)) {
     out.warning("token segments are not valid JSON objects");
-    out.set_null();
     return;
   }
 

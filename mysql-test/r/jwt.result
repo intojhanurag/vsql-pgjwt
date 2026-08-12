@@ -45,6 +45,8 @@ NULL
 SELECT vsql_pgjwt.jwt_decode('not-a-jwt');
 vsql_pgjwt.jwt_decode('not-a-jwt')
 NULL
+Warnings:
+Warning	3200	VDF error in function 'jwt_decode': malformed token; expected header.payload.signature
 # jwt_verify: valid token with far-future exp
 SELECT vsql_pgjwt.jwt_verify('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiZXhwIjo5OTk5OTk5OTk5fQ.3mVWMgf8l4cGF47FqbQtb77353Uns4THWU5lGeoIKms', 'shhh', 'HS256');
 vsql_pgjwt.jwt_verify('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIiwiZXhwIjo5OTk5OTk5OTk5fQ.3mVWMgf8l4cGF47FqbQtb77353Uns4THWU5lGeoIKms', 'shhh', 'HS256')
@@ -73,10 +75,14 @@ NULL
 SELECT vsql_pgjwt.jwt_verify('not-a-jwt', 'shhh', 'HS256');
 vsql_pgjwt.jwt_verify('not-a-jwt', 'shhh', 'HS256')
 NULL
+Warnings:
+Warning	3200	VDF error in function 'jwt_verify': malformed token; expected header.payload.signature
 # jwt_verify: unsupported algorithm (returns NULL with warning)
 SELECT vsql_pgjwt.jwt_verify('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIn0.1XTB_3Wf5J7jaUuDNo_tDoy9kI0SOA9Cwe_7Lt29wPM', 'shhh', 'NONE');
 vsql_pgjwt.jwt_verify('eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyLTQyIn0.1XTB_3Wf5J7jaUuDNo_tDoy9kI0SOA9Cwe_7Lt29wPM', 'shhh', 'NONE')
 NULL
+Warnings:
+Warning	3200	VDF error in function 'jwt_verify': unsupported algorithm; use HS256, HS384, HS512, or RS256
 # Nested key: exp inside nested object should NOT be matched
 SELECT vsql_pgjwt.jwt_verify(vsql_pgjwt.jwt_sign('{"data":{"exp":1000000000},"active":true}', 'k', 'HS256'), 'k', 'HS256') LIKE '%"valid":true%' AS nested_exp_ignored;
 nested_exp_ignored
@@ -110,5 +116,60 @@ rs256_decode_ok
 SELECT vsql_pgjwt.jwt_sign('{"a":1}', 'k', 'HS256') = vsql_pgjwt.jwt_sign('{"a":1}', 'k', 'HS256') AS is_deterministic;
 is_deterministic
 1
+# Expiry: exp is 1000000000 (2001) in every case below, so each token
+# is expired and jwt_verify must say so. The escaped quotes matter:
+# an escape-unaware string scan loses track of the payload after an
+# odd number of them and stops finding exp at all.
+SELECT vsql_pgjwt.jwt_verify(vsql_pgjwt.jwt_sign('{"u":"x","exp":1000000000}', 'k', 'HS256'), 'k', 'HS256') LIKE '%"valid":false%' AS expiry_enforced;
+expiry_enforced
+1
+SELECT vsql_pgjwt.jwt_verify(vsql_pgjwt.jwt_sign('{"u":"x\\"","exp":1000000000}', 'k', 'HS256'), 'k', 'HS256') LIKE '%"valid":false%' AS expiry_enforced;
+expiry_enforced
+1
+SELECT vsql_pgjwt.jwt_verify(vsql_pgjwt.jwt_sign('{"u":"x\\"y\\"z\\"","exp":1000000000}', 'k', 'HS256'), 'k', 'HS256') LIKE '%"valid":false%' AS expiry_enforced;
+expiry_enforced
+1
+SELECT vsql_pgjwt.jwt_verify(vsql_pgjwt.jwt_sign('{"u":"x\\\\","exp":1000000000}', 'k', 'HS256'), 'k', 'HS256') LIKE '%"valid":false%' AS expiry_enforced;
+expiry_enforced
+1
+# Expiry: JSON allows any whitespace between the key and the colon
+SELECT vsql_pgjwt.jwt_verify(vsql_pgjwt.jwt_sign(CONCAT('{"exp"', CHAR(10 USING utf8mb4), ':1000000000}'), 'k', 'HS256'), 'k', 'HS256') LIKE '%"valid":false%' AS expiry_enforced;
+expiry_enforced
+1
+# Expiry: an exp that is not a NumericDate is refused, not ignored
+SELECT vsql_pgjwt.jwt_verify(vsql_pgjwt.jwt_sign('{"exp":"1000000000"}', 'k', 'HS256'), 'k', 'HS256') LIKE '%"valid":false%' AS unreadable_exp_refused;
+unreadable_exp_refused
+1
+SELECT vsql_pgjwt.jwt_verify(vsql_pgjwt.jwt_sign('{"exp":1000000000000000000000}', 'k', 'HS256'), 'k', 'HS256') LIKE '%"valid":false%' AS unreadable_exp_refused;
+unreadable_exp_refused
+1
+# Expiry: exp is optional, so a token without one stays valid
+SELECT vsql_pgjwt.jwt_verify(vsql_pgjwt.jwt_sign('{"sub":"nobody"}', 'k', 'HS256'), 'k', 'HS256') LIKE '%"valid":true%' AS no_exp_still_valid;
+no_exp_still_valid
+1
+# nbf in the future is still refused
+SELECT vsql_pgjwt.jwt_verify(vsql_pgjwt.jwt_sign('{"nbf":4000000000}', 'k', 'HS256'), 'k', 'HS256') LIKE '%"valid":false%' AS nbf_enforced;
+nbf_enforced
+1
+# jwt_decode never returns a value that is not JSON
+SELECT vsql_pgjwt.jwt_decode(vsql_pgjwt.jwt_sign('{garbage', 'k', 'HS256')) IS NULL AS malformed_segment_refused;
+malformed_segment_refused
+1
+Warnings:
+Warning	3200	VDF error in function 'jwt_decode': token segments are not valid JSON objects
+SELECT JSON_VALID(CONVERT(vsql_pgjwt.jwt_decode(vsql_pgjwt.jwt_sign('{"u":"x\\"","exp":1000000000}', 'k', 'HS256')) USING utf8mb4)) AS envelope_is_json;
+envelope_is_json
+1
+# base64url carries no padding and cannot be 1 mod 4 in length
+SELECT vsql_pgjwt.jwt_decode('eyJ=hIjoxfQ.eyJhIjoxfQ.sig') IS NULL AS padding_refused;
+padding_refused
+1
+Warnings:
+Warning	3200	VDF error in function 'jwt_decode': invalid base64url encoding in token
+SELECT vsql_pgjwt.jwt_decode('A.eyJhIjoxfQ.sig') IS NULL AS bad_length_refused;
+bad_length_refused
+1
+Warnings:
+Warning	3200	VDF error in function 'jwt_decode': invalid base64url encoding in token
 # Cleanup temp files
 UNINSTALL EXTENSION vsql_pgjwt;
