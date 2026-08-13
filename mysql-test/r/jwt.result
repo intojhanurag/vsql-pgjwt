@@ -151,7 +151,9 @@ no_exp_still_valid
 SELECT vsql_pgjwt.jwt_verify(vsql_pgjwt.jwt_sign('{"nbf":4000000000}', 'k', 'HS256'), 'k', 'HS256') LIKE '%"valid":false%' AS nbf_enforced;
 nbf_enforced
 1
-# jwt_decode never returns a value that is not JSON
+# jwt_decode refuses a segment that is structurally broken. Note this
+# is a structural check, not a full JSON parse: value grammar such as
+# '{"a":}' is balanced and still gets through.
 SELECT vsql_pgjwt.jwt_decode(vsql_pgjwt.jwt_sign('{garbage', 'k', 'HS256')) IS NULL AS malformed_segment_refused;
 malformed_segment_refused
 1
@@ -168,6 +170,28 @@ Warnings:
 Warning	3200	VDF error in function 'jwt_decode': invalid base64url encoding in token
 SELECT vsql_pgjwt.jwt_decode('A.eyJhIjoxfQ.sig') IS NULL AS bad_length_refused;
 bad_length_refused
+1
+Warnings:
+Warning	3200	VDF error in function 'jwt_decode': invalid base64url encoding in token
+# mismatched delimiters are not balanced JSON
+SELECT vsql_pgjwt.jwt_decode(vsql_pgjwt.jwt_sign('{"a":[1}]', 'k', 'HS256')) IS NULL AS mismatched_refused;
+mismatched_refused
+1
+Warnings:
+Warning	3200	VDF error in function 'jwt_decode': token segments are not valid JSON objects
+SELECT vsql_pgjwt.jwt_decode(vsql_pgjwt.jwt_sign('{"a":1]', 'k', 'HS256')) IS NULL AS mismatched_refused;
+mismatched_refused
+1
+Warnings:
+Warning	3200	VDF error in function 'jwt_decode': token segments are not valid JSON objects
+# segments must use the URL-safe alphabet
+SELECT vsql_pgjwt.jwt_decode('eyJhIjoxfQ.eyJhIjox+Q.sig') IS NULL AS non_urlsafe_refused;
+non_urlsafe_refused
+1
+Warnings:
+Warning	3200	VDF error in function 'jwt_decode': invalid base64url encoding in token
+SELECT vsql_pgjwt.jwt_decode('eyJhIjoxfQ.eyJhIjox/Q.sig') IS NULL AS non_urlsafe_refused;
+non_urlsafe_refused
 1
 Warnings:
 Warning	3200	VDF error in function 'jwt_decode': invalid base64url encoding in token

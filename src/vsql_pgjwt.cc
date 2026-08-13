@@ -80,6 +80,10 @@ static bool base64url_decode(std::string_view input, std::string &out) {
   // encode any byte sequence. Reject both rather than decoding around them.
   if (input.find('=') != std::string_view::npos) return false;
   if (input.size() % 4 == 1) return false;
+  // base64url uses '-' and '_'; the decode table below is standard base64, so
+  // reject their standard counterparts rather than quietly accepting a token
+  // that is not in the encoding the spec requires.
+  if (input.find_first_of("+/") != std::string_view::npos) return false;
 
   std::string b64;
   b64.reserve(input.size() + 4);
@@ -250,7 +254,10 @@ static bool json_is_wellformed_object(std::string_view json) {
   while (i < json.size() && is_json_space(json[i])) i++;
   if (i >= json.size() || json[i] != '{') return false;
 
-  int depth = 0;
+  // Stack of the closers still owed, so that a '}' cannot close a '[' and
+  // vice versa. A single depth counter treats the two as interchangeable and
+  // accepts input like {"a":[1}], which is not JSON.
+  std::string expected;
   for (; i < json.size(); i++) {
     char c = json[i];
     if (c == '"') {
@@ -259,17 +266,22 @@ static bool json_is_wellformed_object(std::string_view json) {
       i = end;
       continue;
     }
-    if (c == '{' || c == '[') {
-      depth++;
+    if (c == '{') {
+      expected.push_back('}');
+      continue;
+    }
+    if (c == '[') {
+      expected.push_back(']');
       continue;
     }
     if (c == '}' || c == ']') {
-      if (--depth == 0) break;
-      if (depth < 0) return false;
+      if (expected.empty() || expected.back() != c) return false;
+      expected.pop_back();
+      if (expected.empty()) break;
       continue;
     }
   }
-  if (depth != 0) return false;
+  if (!expected.empty()) return false;
 
   for (i++; i < json.size(); i++) {
     if (!is_json_space(json[i])) return false;
