@@ -18,6 +18,8 @@
 #include <cctype>
 #include <cstring>
 #include <ctime>
+#include <exception>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -28,6 +30,19 @@
 #include <openssl/pem.h>
 
 using namespace vsql;
+
+// An exception that escapes a VDF aborts mysqld for every connection. Turn it
+// into a warning instead, so only this row returns NULL.
+template <typename Result, typename Body>
+static void guard(Result &out, Body &&body) {
+  try {
+    body();
+  } catch (const std::exception &e) {
+    out.warning(e.what());
+  } catch (...) {
+    out.warning("unexpected error");
+  }
+}
 
 static const char kBase64Chars[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -152,32 +167,26 @@ static bool rsa_sign(std::string_view data, std::string_view pem_key,
       BIO_new_mem_buf(pem_key.data(), static_cast<int>(pem_key.size()));
   if (!bio) return false;
 
-  EVP_PKEY *pkey = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
+  // unique_ptr frees both objects when the vector or the encode below throws.
+  std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> pkey(
+      PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr), EVP_PKEY_free);
   BIO_free(bio);
   if (!pkey) return false;
 
-  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-  if (!ctx) {
-    EVP_PKEY_free(pkey);
+  std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(
+      EVP_MD_CTX_new(), EVP_MD_CTX_free);
+  if (!ctx) return false;
+
+  if (EVP_DigestSignInit(ctx.get(), nullptr, EVP_sha256(), nullptr,
+                         pkey.get()) != 1 ||
+      EVP_DigestSignUpdate(ctx.get(), data.data(), data.size()) != 1)
     return false;
-  }
-
-  bool ok = false;
-  if (EVP_DigestSignInit(ctx, nullptr, EVP_sha256(), nullptr, pkey) == 1 &&
-      EVP_DigestSignUpdate(ctx, data.data(), data.size()) == 1) {
-    size_t sig_len = 0;
-    if (EVP_DigestSignFinal(ctx, nullptr, &sig_len) == 1) {
-      std::vector<unsigned char> sig(sig_len);
-      if (EVP_DigestSignFinal(ctx, sig.data(), &sig_len) == 1) {
-        out = base64url_encode(sig.data(), sig_len);
-        ok = true;
-      }
-    }
-  }
-
-  EVP_MD_CTX_free(ctx);
-  EVP_PKEY_free(pkey);
-  return ok;
+  size_t sig_len = 0;
+  if (EVP_DigestSignFinal(ctx.get(), nullptr, &sig_len) != 1) return false;
+  std::vector<unsigned char> sig(sig_len);
+  if (EVP_DigestSignFinal(ctx.get(), sig.data(), &sig_len) != 1) return false;
+  out = base64url_encode(sig.data(), sig_len);
+  return true;
 }
 
 static bool rsa_verify_sig(std::string_view data, std::string_view sig_b64url,
@@ -374,8 +383,8 @@ static bool constant_time_eq(std::string_view a, std::string_view b) {
 }
 
 // jwt_sign(payload TEXT, secret TEXT, algorithm TEXT) -> TEXT
-void vdf_jwt_sign(StringArg payload_arg, StringArg secret_arg,
-                  StringArg algorithm_arg, StringResult out) {
+static void jwt_sign(StringArg payload_arg, StringArg secret_arg,
+                     StringArg algorithm_arg, StringResult out) {
   if (payload_arg.is_null() || secret_arg.is_null() ||
       algorithm_arg.is_null()) {
     out.set_null();
@@ -419,8 +428,8 @@ void vdf_jwt_sign(StringArg payload_arg, StringArg secret_arg,
 }
 
 // jwt_verify(token TEXT, secret TEXT, algorithm TEXT) -> TEXT
-void vdf_jwt_verify(StringArg token_arg, StringArg secret_arg,
-                    StringArg algorithm_arg, StringResult out) {
+static void jwt_verify(StringArg token_arg, StringArg secret_arg,
+                       StringArg algorithm_arg, StringResult out) {
   if (token_arg.is_null() || secret_arg.is_null() ||
       algorithm_arg.is_null()) {
     out.set_null();
@@ -511,7 +520,7 @@ void vdf_jwt_verify(StringArg token_arg, StringArg secret_arg,
 }
 
 // jwt_decode(token TEXT) -> TEXT
-void vdf_jwt_decode(StringArg token_arg, StringResult out) {
+static void jwt_decode(StringArg token_arg, StringResult out) {
   if (token_arg.is_null()) {
     out.set_null();
     return;
@@ -545,6 +554,20 @@ void vdf_jwt_decode(StringArg token_arg, StringResult out) {
   result += "}";
 
   out.set(std::string_view(result));
+}
+
+void vdf_jwt_sign(StringArg payload_arg, StringArg secret_arg,
+                  StringArg algorithm_arg, StringResult out) {
+  guard(out, [&] { jwt_sign(payload_arg, secret_arg, algorithm_arg, out); });
+}
+
+void vdf_jwt_verify(StringArg token_arg, StringArg secret_arg,
+                    StringArg algorithm_arg, StringResult out) {
+  guard(out, [&] { jwt_verify(token_arg, secret_arg, algorithm_arg, out); });
+}
+
+void vdf_jwt_decode(StringArg token_arg, StringResult out) {
+  guard(out, [&] { jwt_decode(token_arg, out); });
 }
 
 VEF_GENERATE_ENTRY_POINTS(
