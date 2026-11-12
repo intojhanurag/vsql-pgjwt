@@ -151,6 +151,13 @@ no_exp_still_valid
 SELECT vsql_pgjwt.jwt_verify(vsql_pgjwt.jwt_sign('{"nbf":4000000000}', 'k', 'HS256'), 'k', 'HS256') LIKE '%"valid":false%' AS nbf_enforced;
 nbf_enforced
 1
+# A string value equal to a claim name is not that claim
+SELECT vsql_pgjwt.jwt_verify(vsql_pgjwt.jwt_sign('{"sub":"exp","scope":"nbf"}', 'k', 'HS256'), 'k', 'HS256') LIKE '%"valid":true%' AS value_is_not_claim;
+value_is_not_claim
+1
+SELECT vsql_pgjwt.jwt_verify(vsql_pgjwt.jwt_sign('{"type":"exp","exp":1000000000}', 'k', 'HS256'), 'k', 'HS256') LIKE '%"valid":false%' AS expiry_enforced;
+expiry_enforced
+1
 # jwt_decode refuses a segment that is structurally broken. Note this
 # is a structural check, not a full JSON parse: value grammar such as
 # '{"a":}' is balanced and still gets through.

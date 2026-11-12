@@ -316,7 +316,11 @@ static ClaimResult extract_json_int(std::string_view json, const char *key,
 
     size_t end = json_string_end(json, i);
     if (end == std::string_view::npos) return ClaimResult::kMalformed;
-    if (depth != 1 || json.substr(i, end - i + 1) != pat) {
+    // A string after a colon is a value, as in {"sub":"exp"}, not a key.
+    size_t before = i;
+    while (before > 0 && is_json_space(json[before - 1])) before--;
+    bool is_value = before > 0 && json[before - 1] == ':';
+    if (depth != 1 || is_value || json.substr(i, end - i + 1) != pat) {
       i = end;
       continue;
     }
