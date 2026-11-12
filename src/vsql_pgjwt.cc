@@ -19,6 +19,7 @@
 #include <cstring>
 #include <ctime>
 #include <exception>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -158,32 +159,26 @@ static bool rsa_sign(std::string_view data, std::string_view pem_key,
       BIO_new_mem_buf(pem_key.data(), static_cast<int>(pem_key.size()));
   if (!bio) return false;
 
-  EVP_PKEY *pkey = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
+  // unique_ptr frees both objects when the vector or the encode below throws.
+  std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> pkey(
+      PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr), EVP_PKEY_free);
   BIO_free(bio);
   if (!pkey) return false;
 
-  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-  if (!ctx) {
-    EVP_PKEY_free(pkey);
+  std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(
+      EVP_MD_CTX_new(), EVP_MD_CTX_free);
+  if (!ctx) return false;
+
+  if (EVP_DigestSignInit(ctx.get(), nullptr, EVP_sha256(), nullptr,
+                         pkey.get()) != 1 ||
+      EVP_DigestSignUpdate(ctx.get(), data.data(), data.size()) != 1)
     return false;
-  }
-
-  bool ok = false;
-  if (EVP_DigestSignInit(ctx, nullptr, EVP_sha256(), nullptr, pkey) == 1 &&
-      EVP_DigestSignUpdate(ctx, data.data(), data.size()) == 1) {
-    size_t sig_len = 0;
-    if (EVP_DigestSignFinal(ctx, nullptr, &sig_len) == 1) {
-      std::vector<unsigned char> sig(sig_len);
-      if (EVP_DigestSignFinal(ctx, sig.data(), &sig_len) == 1) {
-        out = base64url_encode(sig.data(), sig_len);
-        ok = true;
-      }
-    }
-  }
-
-  EVP_MD_CTX_free(ctx);
-  EVP_PKEY_free(pkey);
-  return ok;
+  size_t sig_len = 0;
+  if (EVP_DigestSignFinal(ctx.get(), nullptr, &sig_len) != 1) return false;
+  std::vector<unsigned char> sig(sig_len);
+  if (EVP_DigestSignFinal(ctx.get(), sig.data(), &sig_len) != 1) return false;
+  out = base64url_encode(sig.data(), sig_len);
+  return true;
 }
 
 static bool rsa_verify_sig(std::string_view data, std::string_view sig_b64url,
